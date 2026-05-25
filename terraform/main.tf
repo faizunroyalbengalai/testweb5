@@ -24,7 +24,7 @@ variable "instance_type" {
 }
 
 variable "project_name" {
-  description = "Project name for tagging"
+  description = "Project name"
   type        = string
   default     = "testweb5"
 }
@@ -33,6 +33,17 @@ variable "app_name" {
   description = "Application name"
   type        = string
   default     = "node"
+}
+
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
 }
 
 data "aws_ami" "ubuntu" {
@@ -47,17 +58,6 @@ data "aws_ami" "ubuntu" {
   filter {
     name   = "virtualization-type"
     values = ["hvm"]
-  }
-}
-
-data "aws_vpc" "default" {
-  default = true
-}
-
-data "aws_subnets" "default" {
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.default.id]
   }
 }
 
@@ -134,8 +134,9 @@ resource "aws_instance" "app" {
   associate_public_ip_address = true
 
   root_block_device {
-    volume_size = 20
-    volume_type = "gp3"
+    volume_size           = 20
+    volume_type           = "gp3"
+    delete_on_termination = true
   }
 
   tags = {
@@ -156,13 +157,13 @@ output "public_ip" {
 }
 
 output "public_dns" {
-  description = "Public DNS of the EC2 instance"
+  description = "Public DNS name of the EC2 instance"
   value       = aws_instance.app.public_dns
 }
 
 output "ssh_connection" {
   description = "SSH connection string"
-  value       = "ssh ubuntu@${aws_instance.app.public_ip}"
+  value       = "ssh -i <private_key> ubuntu@${aws_instance.app.public_ip}"
 }
 
 output "app_url" {
