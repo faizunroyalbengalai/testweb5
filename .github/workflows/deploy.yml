@@ -1,0 +1,169 @@
+name: Deploy testweb5 node to EC2
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  provision:
+    name: Provision EC2 with Terraform
+    runs-on: ubuntu-latest
+    outputs:
+      server_ip: ${{ steps.get_ip.outputs.server_ip }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=us-east-1" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+
+      - name: Terraform apply
+        working-directory: terraform
+        run: |
+          terraform apply -auto-approve \
+            -var="public_key=${{ secrets.EC2_SSH_PUBLIC_KEY }}" \
+            -var="region=us-east-1" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}"
+
+      - name: Get server IP
+        id: get_ip
+        working-directory: terraform
+        run: |
+          SERVER_IP=$(terraform output -raw public_ip)
+          echo "server_ip=$SERVER_IP" >> "$GITHUB_OUTPUT"
+
+  configure:
+    name: Configure EC2 with Ansible
+    runs-on: ubuntu-latest
+    needs: provision
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Ansible
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ansible
+
+      - name: Write SSH private key
+        run: |
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+
+      - name: Wait for EC2 SSH to be ready
+        run: |
+          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
+          echo "Waiting for SSH on $SERVER_IP..."
+          for i in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i /tmp/deploy_key ubuntu@"$SERVER_IP" echo "SSH ready" 2>/dev/null; then
+              echo "SSH is available"
+              exit 0
+            fi
+            echo "Attempt $i/30 failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "SSH did not become available in time"
+          exit 1
+
+      - name: Run Ansible playbook
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
+          ansible-playbook -i "$SERVER_IP," \
+            -u ubuntu \
+            --private-key /tmp/deploy_key \
+            ansible/playbook.yml \
+            -e node_env_database_url='${{ secrets.DATABASE_URL }}' \
+            -e node_env_mongo_uri='${{ secrets.MONGO_URI }}' \
+            -e node_env_db_host='${{ secrets.DB_HOST }}' \
+            -e node_env_db_port='${{ secrets.DB_PORT }}' \
+            -e node_env_db_name='${{ secrets.DB_NAME }}' \
+            -e node_env_db_user='${{ secrets.DB_USER }}' \
+            -e node_env_db_password='${{ secrets.DB_PASSWORD }}' \
+            -e install_db='${{ secrets.INSTALL_DB_ON_EC2 }}' \
+            -e db_type='${{ secrets.DB_TYPE }}' \
+            -e db_name='${{ secrets.DB_NAME }}' \
+            -e db_username='${{ secrets.DB_USERNAME }}' \
+            -e db_password='${{ secrets.DB_PASSWORD }}'
+
+  verify:
+    name: Verify deployment
+    runs-on: ubuntu-latest
+    needs: [provision, configure]
+    steps:
+      - name: Write SSH private key
+        run: |
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+
+      - name: Verify application health via SSH
+        run: |
+          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
+          ssh -o StrictHostKeyChecking=no -i /tmp/deploy_key ubuntu@"$SERVER_IP" bash << 'ENDSSH'
+            echo "Waiting for app on 127.0.0.1:3000..."
+            SUCCESS=0
+            for i in $(seq 1 12); do
+              if curl -sf http://127.0.0.1:3000/health > /dev/null 2>&1; then
+                echo "Health check passed on attempt $i"
+                SUCCESS=1
+                break
+              fi
+              echo "Attempt $i/12 failed, retrying in 10s..."
+              sleep 10
+            done
+            if [ "$SUCCESS" -ne 1 ]; then
+              echo "Health check failed after 120s. Dumping PM2 logs:"
+              pm2 logs app --lines 100 --nostream || true
+              exit 1
+            fi
+          ENDSSH
+
+      - name: Print server IP
+        run: |
+          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
+          echo "msg: 'server_ip=$SERVER_IP'"
+
+  notify:
+    name: Notify deployment result
+    runs-on: ubuntu-latest
+    needs: [provision, verify]
+    if: always()
+    steps:
+      - name: Deployment success
+        if: ${{ needs.verify.result == 'success' }}
+        run: |
+          echo "Deployment of testweb5 node to EC2 succeeded."
+          echo "Server IP: ${{ needs.provision.outputs.server_ip }}"
+
+      - name: Deployment failure
+        if: ${{ needs.verify.result != 'success' }}
+        run: |
+          echo "Deployment of testweb5 node to EC2 FAILED."
+          echo "Server IP: ${{ needs.provision.outputs.server_ip }}"
+          exit 1
